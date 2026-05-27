@@ -14,7 +14,14 @@ DEFAULT_ALGORITHMS = ["apriori", "fpgrowth", "eclat"]
 
 
 def parse_items(value: str) -> list[str]:
-    return str(value).split()
+    if not isinstance(value, str):
+        return []
+    cleaned = value.strip("[]")
+    if "," in cleaned:
+        items = [item.strip().strip("'\"") for item in cleaned.split(",") if item.strip()]
+    else:
+        items = [item for item in cleaned.split() if item]
+    return [item.zfill(10) for item in items]
 
 
 def load_baskets(
@@ -26,12 +33,31 @@ def load_baskets(
     min_items: int,
 ) -> list[list[str]]:
     usecols = ["t_dat", "items"]
-    baskets = pd.read_csv(baskets_path, usecols=usecols, nrows=max_baskets)
+    if start_date is None and end_date is None:
+        baskets = pd.read_csv(baskets_path, usecols=usecols, nrows=max_baskets)
+    else:
+        chunks = []
+        collected = 0
+        for chunk in pd.read_csv(baskets_path, usecols=usecols, chunksize=200_000):
+            if start_date is not None:
+                chunk = chunk[chunk["t_dat"] >= start_date]
+            if end_date is not None:
+                chunk = chunk[chunk["t_dat"] <= end_date]
+            if chunk.empty:
+                continue
 
-    if start_date is not None:
-        baskets = baskets[baskets["t_dat"] >= start_date]
-    if end_date is not None:
-        baskets = baskets[baskets["t_dat"] <= end_date]
+            if max_baskets is not None:
+                remaining = max_baskets - collected
+                if remaining <= 0:
+                    break
+                chunk = chunk.head(remaining)
+
+            chunks.append(chunk)
+            collected += len(chunk)
+            if max_baskets is not None and collected >= max_baskets:
+                break
+
+        baskets = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=usecols)
 
     transactions = baskets["items"].map(parse_items).tolist()
 

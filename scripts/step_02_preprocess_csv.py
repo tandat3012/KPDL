@@ -144,8 +144,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create cleaned basket data for Apriori, FP-growth, and Eclat."
     )
-    parser.add_argument("--transactions", default="transactions_train.csv")
-    parser.add_argument("--articles", default="articles.csv")
+    parser.add_argument("--transactions", default="orginal_data_csv/transactions_train.csv")
+    parser.add_argument("--articles", default="orginal_data_csv/articles.csv")
     parser.add_argument("--output-dir", default="processed")
     parser.add_argument("--chunksize", type=int, default=500_000)
     parser.add_argument("--min-items", type=int, default=2)
