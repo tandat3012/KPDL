@@ -34,8 +34,14 @@ venv.bak/
 
 # Data Files (Original, Processed)
 *.csv
+*.sqlite
+*.sqlite3
+*.db
 
+orginal_data_csv/
+processed/
 processed_test/
+reports/
 
 # Result Files
 results/
@@ -48,3 +54,4 @@ results_test/
 .idea/
 *.swp
 .DS_Store
+.codex

@@ -1,5 +1,7 @@
 import argparse
+import gc
 import os
+import tracemalloc
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
@@ -7,7 +9,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from benchmark_algorithms import (
+from step_03_benchmark_algorithms import (
     DEFAULT_ALGORITHMS,
     compare_results,
     encode_transactions,
@@ -40,6 +42,8 @@ def run_algorithms(args: argparse.Namespace) -> tuple[dict[str, object], dict[st
     results: dict[str, pd.DataFrame] = {}
     metrics: dict[str, dict[str, float | int]] = {}
     for name in args.algorithms:
+        gc.collect()
+        tracemalloc.start()
         started = time.perf_counter()
         if name == "eclat":
             itemsets = run_eclat(transactions, args.min_support, args.max_len)
@@ -49,9 +53,12 @@ def run_algorithms(args: argparse.Namespace) -> tuple[dict[str, object], dict[st
             itemsets = run_mlxtend_algorithm(name, encoded, args.min_support, args.max_len)
 
         elapsed = time.perf_counter() - started
+        _, peak_memory = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
         results[name] = itemsets
         metrics[name] = {
             "elapsed_seconds": elapsed,
+            "peak_memory_mb": peak_memory / (1024 * 1024),
             "frequent_itemsets": len(itemsets),
             "max_itemset_length": int(itemsets["length"].max()) if not itemsets.empty else 0,
         }
@@ -80,7 +87,7 @@ def plot_comparison(summary: dict[str, object], output_path: Path) -> None:
     metrics = summary["metrics"]
     names = list(metrics.keys())
     elapsed = [metrics[name]["elapsed_seconds"] for name in names]
-    itemsets = [metrics[name]["frequent_itemsets"] for name in names]
+    peak_memory = [metrics[name]["peak_memory_mb"] for name in names]
     max_lengths = [metrics[name]["max_itemset_length"] for name in names]
 
     comparison = summary["comparison"]
@@ -109,10 +116,10 @@ def plot_comparison(summary: dict[str, object], output_path: Path) -> None:
     axes[0, 0].set_ylabel("Seconds")
     add_bar_labels(axes[0, 0], elapsed, "{:.4f}s")
 
-    axes[0, 1].bar(names, itemsets, color=["#4c78a8", "#f58518", "#54a24b"][: len(names)])
-    axes[0, 1].set_title("Frequent Itemsets")
-    axes[0, 1].set_ylabel("Count")
-    add_bar_labels(axes[0, 1], itemsets, "{:.0f}")
+    axes[0, 1].bar(names, peak_memory, color=["#4c78a8", "#f58518", "#54a24b"][: len(names)])
+    axes[0, 1].set_title("Peak Python Memory")
+    axes[0, 1].set_ylabel("MiB")
+    add_bar_labels(axes[0, 1], peak_memory, "{:.2f}")
 
     axes[1, 0].bar(names, max_lengths, color=["#4c78a8", "#f58518", "#54a24b"][: len(names)])
     axes[1, 0].set_title("Max Itemset Length Found")
@@ -168,6 +175,7 @@ def main() -> None:
         print(
             f"{name}: "
             f"{metrics['elapsed_seconds']:.4f}s, "
+            f"{metrics['peak_memory_mb']:.2f} MiB peak, "
             f"{metrics['frequent_itemsets']} itemsets, "
             f"max_len_found={metrics['max_itemset_length']}"
         )
