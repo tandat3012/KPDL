@@ -24,6 +24,8 @@ MANIFEST
 
 # Environments
 KPDL_env/
+KPDL_tf_env/
+.python312/
 .env
 .venv
 env/
