@@ -12,7 +12,6 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 from mlxtend.frequent_patterns import association_rules
-
 from step_03_benchmark_algorithms import (
     encode_transactions,
     load_article_names,
