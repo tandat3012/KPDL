@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
+from mlxtend.frequent_patterns import association_rules
+
 from step_03_benchmark_algorithms import (
     encode_transactions,
     load_article_names,
@@ -152,6 +154,15 @@ SELECT_OPTIONS = {
         ("50", "Top 50"),
         ("100", "Top 100"),
     ],
+    "display_mode": [
+        ("rules", "Luật gợi ý mua kèm"),
+        ("itemsets", "Combo phổ biến"),
+    ],
+    "sort_metric": [
+        ("lift", "Lift - độ liên quan"),
+        ("confidence", "Confidence - xác suất gợi ý"),
+        ("support", "Support - độ phổ biến"),
+    ],
 }
 
 DATE_RANGES = {
@@ -172,6 +183,9 @@ PATTERN_DEFAULTS = {
     "max_len": "3",
     "date_range": "all",
     "top_results": "30",
+    "display_mode": "rules",
+    "min_confidence": "0.3",
+    "sort_metric": "lift",
 }
 
 
@@ -187,8 +201,8 @@ def parse_float(value: str, field: str) -> float:
         parsed = float(value)
     except ValueError as exc:
         raise ValueError(f"{field} must be a number.") from exc
-    if field == "min_support" and not 0 < parsed <= 1:
-        raise ValueError("min_support must be greater than 0 and less than or equal to 1.")
+    if field in {"min_support", "min_confidence"} and not 0 < parsed <= 1:
+        raise ValueError(f"{field} must be greater than 0 and less than or equal to 1.")
     return parsed
 
 
@@ -287,6 +301,12 @@ def pattern_params_from_query(query: dict[str, list[str]]) -> SimpleNamespace:
     max_len = parse_int(query.get("max_len", [PATTERN_DEFAULTS["max_len"]])[0], "max_len")
     if min_itemset_length > max_len:
         raise ValueError("Độ dài combo tối thiểu không được lớn hơn Max Length.")
+    display_mode = query.get("display_mode", [PATTERN_DEFAULTS["display_mode"]])[0]
+    if display_mode not in {"itemsets", "rules"}:
+        raise ValueError("Invalid display mode.")
+    sort_metric = query.get("sort_metric", [PATTERN_DEFAULTS["sort_metric"]])[0]
+    if sort_metric not in {"support", "confidence", "lift"}:
+        raise ValueError("Invalid sort metric.")
 
     return SimpleNamespace(
         baskets=baskets,
@@ -297,8 +317,14 @@ def pattern_params_from_query(query: dict[str, list[str]]) -> SimpleNamespace:
         min_items=parse_int(query.get("min_items", [PATTERN_DEFAULTS["min_items"]])[0], "min_items"),
         min_itemset_length=min_itemset_length,
         min_support=parse_float(query.get("min_support", [PATTERN_DEFAULTS["min_support"]])[0], "min_support"),
+        min_confidence=parse_float(
+            query.get("min_confidence", [PATTERN_DEFAULTS["min_confidence"]])[0],
+            "min_confidence",
+        ),
         max_len=max_len,
         top_results=parse_int(query.get("top_results", [PATTERN_DEFAULTS["top_results"]])[0], "top_results"),
+        display_mode=display_mode,
+        sort_metric=sort_metric,
         start_date=start_date,
         end_date=end_date,
         date_range=date_range,
@@ -341,8 +367,11 @@ def pattern_values_from_args(args: SimpleNamespace | None) -> dict[str, object]:
         "min_items": str(args.min_items),
         "min_itemset_length": str(args.min_itemset_length),
         "min_support": str(args.min_support),
+        "min_confidence": str(args.min_confidence),
         "max_len": str(args.max_len),
         "top_results": str(args.top_results),
+        "display_mode": args.display_mode,
+        "sort_metric": args.sort_metric,
         "date_range": getattr(args, "date_range", "all"),
     }
 
@@ -434,7 +463,7 @@ def render_metrics_table(summary: dict[str, object]) -> str:
     """ % "\n".join(rows)
 
 
-def run_pattern_mining(args: SimpleNamespace) -> tuple[dict[str, object], object]:
+def run_pattern_mining(args: SimpleNamespace) -> tuple[dict[str, object], object, object]:
     max_baskets = args.max_baskets if args.max_baskets > 0 else None
     top_items = args.top_items if args.top_items > 0 else None
     transactions = load_baskets(
@@ -456,25 +485,59 @@ def run_pattern_mining(args: SimpleNamespace) -> tuple[dict[str, object], object
         itemsets = run_mlxtend_algorithm(args.algorithm, encoded, args.min_support, args.max_len)
 
     total_frequent_itemsets = len(itemsets)
-    itemsets = itemsets[itemsets["length"] >= args.min_itemset_length]
-    itemsets = itemsets.sort_values(["support", "length", "itemsets"], ascending=[False, False, True])
+    filtered_itemsets = itemsets[itemsets["length"] >= args.min_itemset_length]
+    filtered_itemsets = filtered_itemsets.sort_values(["support", "length", "itemsets"], ascending=[False, False, True])
+    rules = build_association_rules(itemsets, len(transactions), args)
     summary = {
         "basket_dataset": args.basket_dataset,
         "baskets": args.baskets,
         "algorithm": args.algorithm,
         "transactions": len(transactions),
         "unique_items": len({item for transaction in transactions for item in transaction}),
-        "frequent_itemsets": len(itemsets),
+        "frequent_itemsets": len(filtered_itemsets),
         "total_frequent_itemsets": total_frequent_itemsets,
+        "rules": len(rules),
         "elapsed_seconds": time.perf_counter() - started,
         "max_baskets": max_baskets,
         "top_items": top_items,
         "min_support": args.min_support,
+        "min_confidence": args.min_confidence,
         "min_itemset_length": args.min_itemset_length,
         "max_len": args.max_len,
+        "display_mode": args.display_mode,
+        "sort_metric": args.sort_metric,
         "date_range": args.date_range,
     }
-    return summary, itemsets.head(args.top_results)
+    return summary, filtered_itemsets.head(args.top_results), rules.head(args.top_results)
+
+
+def build_association_rules(itemsets, transaction_count: int, args: SimpleNamespace):
+    if itemsets.empty or itemsets["length"].max() < 2:
+        return itemsets.iloc[0:0].copy()
+
+    try:
+        rules = association_rules(
+            itemsets,
+            num_itemsets=transaction_count,
+            metric="confidence",
+            min_threshold=args.min_confidence,
+        )
+    except ValueError:
+        return itemsets.iloc[0:0].copy()
+
+    if rules.empty:
+        return rules
+
+    rules = rules.copy()
+    rules["antecedents"] = rules["antecedents"].map(lambda items: tuple(sorted(items)))
+    rules["consequents"] = rules["consequents"].map(lambda items: tuple(sorted(items)))
+    rules["rule_length"] = rules["antecedents"].map(len) + rules["consequents"].map(len)
+    rules = rules[rules["rule_length"] >= args.min_itemset_length]
+    rules = rules.sort_values(
+        [args.sort_metric, "confidence", "support"],
+        ascending=[False, False, False],
+    )
+    return rules.reset_index(drop=True)
 
 
 def readable_item(item: str, article_names: dict[str, str]) -> str:
@@ -494,17 +557,21 @@ def readable_item(item: str, article_names: dict[str, str]) -> str:
     return item.replace("_", " ").title()
 
 
+def readable_items(items: tuple[str, ...], article_names: dict[str, str]) -> str:
+    return " + ".join(readable_item(item, article_names) for item in items)
+
+
 def render_patterns_table(itemsets, basket_dataset: str) -> str:
     article_names = load_article_names(Path("processed/articles_minimal.csv"))
     rows = []
     for row in itemsets.itertuples(index=False):
         raw_items = tuple(row.itemsets)
-        readable_items = [readable_item(item, article_names) for item in raw_items]
+        display_items = [readable_item(item, article_names) for item in raw_items]
         rows.append(
             "<tr>"
             f"<td>{row.support:.4f}</td>"
             f"<td>{len(raw_items)}</td>"
-            f"<td>{html.escape(' + '.join(readable_items))}</td>"
+            f"<td>{html.escape(' + '.join(display_items))}</td>"
             f"<td>{html.escape(' '.join(raw_items))}</td>"
             "</tr>"
         )
@@ -599,7 +666,145 @@ def render_recommendation_cards(itemsets, basket_dataset: str, transactions: int
     """
 
 
-def render_pattern_result(args: SimpleNamespace, summary: dict[str, object], itemsets) -> str:
+def render_rule_cards(rules, basket_dataset: str, transactions: int) -> str:
+    article_names = load_article_names(Path("processed/articles_minimal.csv"))
+    cards = []
+
+    for index, row in enumerate(rules.itertuples(index=False), start=1):
+        antecedents = tuple(row.antecedents)
+        consequents = tuple(row.consequents)
+        support_count = round(row.support * transactions)
+        antecedent_text = readable_items(antecedents, article_names)
+        consequent_text = readable_items(consequents, article_names)
+
+        if basket_dataset in {"product_group", "garment_group", "section", "outfit_category"}:
+            action = "Luật này có thể dùng làm gợi ý phối đồ hoặc combo nhóm sản phẩm."
+        elif basket_dataset.startswith("age_"):
+            action = "Luật này giúp giải thích xu hướng mua kèm trong phân khúc tuổi đã chọn."
+        elif basket_dataset.startswith("year_"):
+            action = "Luật này giúp mô tả xu hướng mua kèm trong giai đoạn/năm đã chọn."
+        else:
+            action = "Luật này có thể dùng làm gợi ý mua kèm ở cấp sản phẩm."
+
+        cards.append(
+            f"""
+            <article class="combo-card">
+              <div class="combo-rank">Rule #{index}</div>
+              <h3>Nếu mua {html.escape(antecedent_text)}</h3>
+              <p>Gợi ý thêm: <strong>{html.escape(consequent_text)}</strong></p>
+              <p>{html.escape(action)}</p>
+              <div class="combo-meta">
+                <span>Confidence: {row.confidence:.2%}</span>
+                <span>Lift: {row.lift:.2f}</span>
+                <span>Support: {row.support:.2%}</span>
+                <span>Khoảng {support_count:,}/{transactions:,} giỏ</span>
+              </div>
+            </article>
+            """
+        )
+
+        if len(cards) >= 6:
+            break
+
+    if not cards:
+        return """
+        <div class="recommendations">
+          <h2>Luật gợi ý mua kèm</h2>
+          <p>Không có rule nào thỏa điều kiện. Hãy giảm Min Support, giảm Min Confidence hoặc tăng số basket/top items.</p>
+        </div>
+        """
+
+    return f"""
+    <div class="recommendations">
+      <h2>Luật gợi ý mua kèm</h2>
+      <p>Các thẻ dưới đây diễn giải luật dạng: nếu khách mua nhóm A thì nên gợi ý nhóm B.</p>
+      <div class="combo-grid">{''.join(cards)}</div>
+    </div>
+    """
+
+
+def render_rules_table(rules) -> str:
+    article_names = load_article_names(Path("processed/articles_minimal.csv"))
+    if rules.empty:
+        return "<p>Không có association rules với cấu hình hiện tại.</p>"
+
+    rows = []
+    for row in rules.itertuples(index=False):
+        antecedents = tuple(row.antecedents)
+        consequents = tuple(row.consequents)
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(readable_items(antecedents, article_names))}</td>"
+            f"<td>{html.escape(readable_items(consequents, article_names))}</td>"
+            f"<td>{row.support:.4f}</td>"
+            f"<td>{row.confidence:.4f}</td>"
+            f"<td>{row.lift:.4f}</td>"
+            f"<td>{row.rule_length}</td>"
+            "</tr>"
+        )
+
+    return f"""
+    <h2>Bảng association rules</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Nếu mua</th>
+            <th>Gợi ý thêm</th>
+            <th>Support</th>
+            <th>Confidence</th>
+            <th>Lift</th>
+            <th>Độ dài rule</th>
+          </tr>
+        </thead>
+        <tbody>{''.join(rows)}</tbody>
+      </table>
+    </div>
+    """
+
+
+def render_rule_insights(rules, args: SimpleNamespace) -> str:
+    if rules.empty:
+        return """
+        <div class="insights">
+          <h2>Nhận xét luật gợi ý</h2>
+          <ul>
+            <li>Không có rule nào thỏa điều kiện hiện tại.</li>
+            <li>Thử giảm Min Confidence hoặc Min Support để lấy thêm luật.</li>
+          </ul>
+        </div>
+        """
+
+    best_confidence = rules.sort_values("confidence", ascending=False).iloc[0]
+    best_lift = rules.sort_values("lift", ascending=False).iloc[0]
+    notes = [
+        f"Đang sắp xếp rule theo {args.sort_metric}.",
+        f"Rule confidence cao nhất đạt {best_confidence['confidence']:.2%}.",
+        f"Rule lift cao nhất đạt {best_lift['lift']:.2f}. Lift > 1 nghĩa là hai phía xuất hiện cùng nhau nhiều hơn ngẫu nhiên.",
+    ]
+    if best_lift["lift"] <= 1.05:
+        notes.append("Lift cao nhất khá gần 1, quan hệ mua kèm chưa thật sự mạnh.")
+    if args.min_confidence >= 0.7:
+        notes.append("Min Confidence đang cao, số rule có thể ít nhưng thường đáng tin hơn.")
+
+    items = "".join(f"<li>{html.escape(note)}</li>" for note in notes)
+    return f"""
+    <div class="insights">
+      <h2>Nhận xét luật gợi ý</h2>
+      <ul>{items}</ul>
+    </div>
+    """
+
+
+def render_pattern_result(args: SimpleNamespace, summary: dict[str, object], itemsets, rules) -> str:
+    main_result = (
+        render_rule_insights(rules, args)
+        + render_rule_cards(rules, args.basket_dataset, summary["transactions"])
+        + render_rules_table(rules)
+        if args.display_mode == "rules"
+        else render_recommendation_cards(itemsets, args.basket_dataset, summary["transactions"])
+        + render_patterns_table(itemsets, args.basket_dataset)
+    )
     return f"""
     <div class="insights">
       <h2>Tóm tắt lần phân tích</h2>
@@ -610,13 +815,15 @@ def render_pattern_result(args: SimpleNamespace, summary: dict[str, object], ite
         <li>Số item khác nhau sau lọc: {summary['unique_items']:,}</li>
         <li>Số frequent itemsets sau khi lọc độ dài combo: {summary['frequent_itemsets']:,}</li>
         <li>Tổng frequent itemsets trước khi lọc độ dài combo: {summary['total_frequent_itemsets']:,}</li>
+        <li>Số association rules thỏa điều kiện: {summary['rules']:,}</li>
+        <li>Chế độ hiển thị: {html.escape(args.display_mode)}</li>
+        <li>Min Confidence: {args.min_confidence:.2%}</li>
         <li>Cỡ basket đầu vào tối thiểu: {args.min_items} item</li>
         <li>Độ dài combo tối thiểu hiển thị: {args.min_itemset_length} item</li>
         <li>Thời gian chạy: {summary['elapsed_seconds']:.4f}s</li>
       </ul>
     </div>
-    {render_recommendation_cards(itemsets, args.basket_dataset, summary['transactions'])}
-    {render_patterns_table(itemsets, args.basket_dataset)}
+    {main_result}
     """
 
 
@@ -1216,12 +1423,15 @@ def render_patterns_page(values: dict[str, object], result_html: str = "") -> st
       <form action="/patterns/run" method="get">
         {select_from_options("Loại basket", "basket_dataset", basket_options, "Chọn basket gốc, theo tuổi, theo năm hoặc theo category.")}
         {input_field("File CSV giỏ hàng", "baskets", "Chỉ dùng khi chọn Loại basket = Custom path.")}
+        {select_from_options("Chế độ hiển thị", "display_mode", SELECT_OPTIONS["display_mode"], "Luật gợi ý dùng confidence/lift; Combo phổ biến dùng support.")}
         {select_from_options("Thuật toán", "algorithm", algorithm_options, "Dùng FP-growth mặc định để xem pattern nhanh.")}
         {select_from_options("Số giỏ hàng tối đa", "max_baskets", SELECT_OPTIONS["max_baskets"])}
         {select_from_options("Số mặt hàng lấy top", "top_items", SELECT_OPTIONS["top_items"])}
         {select_from_options("Cỡ basket đầu vào tối thiểu", "min_items", SELECT_OPTIONS["min_items"], "Lọc dữ liệu đầu vào, không phải độ dài combo kết quả.")}
         {select_from_options("Độ dài combo tối thiểu", "min_itemset_length", SELECT_OPTIONS["min_itemset_length"], "Lọc kết quả hiển thị. Chọn 3 thì không hiện combo 2 item.")}
         {input_field("Min Support", "min_support", "Nhập số trong khoảng 0-1. Ví dụ: 0.5 = 50%, 0.05 = 5%, 0.005 = 0.5%.")}
+        {input_field("Min Confidence", "min_confidence", "Chỉ dùng cho Luật gợi ý. Ví dụ: 0.3 = 30%, 0.7 = 70%.")}
+        {select_from_options("Sắp xếp luật theo", "sort_metric", SELECT_OPTIONS["sort_metric"], "Lift đo độ liên quan, confidence đo xác suất gợi ý.")}
         {select_from_options("Max Length", "max_len", SELECT_OPTIONS["max_len"])}
         {select_from_options("Khoảng thời gian", "date_range", SELECT_OPTIONS["date_range"])}
         {select_from_options("Số dòng kết quả", "top_results", SELECT_OPTIONS["top_results"])}
@@ -1289,11 +1499,11 @@ class AlgorithmUIHandler(BaseHTTPRequestHandler):
             args = None
             try:
                 args = pattern_params_from_query(query)
-                summary, itemsets = run_pattern_mining(args)
+                summary, itemsets, rules = run_pattern_mining(args)
                 self.send_html(
                     render_patterns_page(
                         pattern_values_from_args(args),
-                        render_pattern_result(args, summary, itemsets),
+                        render_pattern_result(args, summary, itemsets, rules),
                     )
                 )
             except Exception as exc:
