@@ -1,0 +1,11 @@
+{
+  "catalog_size": 30,
+  "max_seq_len": 20,
+  "num_items": 31,
+  "padding_unknown_id": 0,
+  "models": {
+    "lstm": "best_lstm_attention_model.keras",
+    "transformer": "best_transformer_model.keras"
+  },
+  "note": "Model du doan san pham tiep theo trong nhom san pham pho bien nhat. ID 0 la padding/unknown."
+}
