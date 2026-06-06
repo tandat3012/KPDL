@@ -1,7 +1,7 @@
 {
-  "catalog_size": 30,
+  "catalog_size": 100,
   "max_seq_len": 20,
-  "num_items": 31,
+  "num_items": 101,
   "padding_unknown_id": 0,
   "models": {
     "lstm": "best_lstm_attention_model.keras",
