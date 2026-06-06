@@ -48,7 +48,15 @@ HISTORY_PATH = Path("results/ui_runs.csv")
 CHART_DIR = Path("results/ui_charts")
 BASKET_MANIFEST_PATH = Path("processed/basket_variants/manifest.json")
 MODEL_DIR = Path("hm_lstm-trans_web_files")
-MODEL_COMPARISON_PATH = MODEL_DIR / "lstm_vs_transformer_comparison.csv"
+MODEL_COMPARISON_PATH = MODEL_DIR / "result_comparison.csv"
+MODEL_CONFIG_PATH = MODEL_DIR / "model_config.json"
+OLD_TO_NEW_MAP_PATH = MODEL_DIR / "old_to_new_item_map.json"
+NEW_TO_OLD_MAP_PATH = MODEL_DIR / "new_to_old_item_map.json"
+TOP_ITEMS_PATH = MODEL_DIR / "top_items.csv"
+MODEL_HISTORY_PATHS = {
+    "LSTM + Attention": MODEL_DIR / "history_lstm.csv",
+    "Transformer": MODEL_DIR / "history_transformer.csv",
+}
 MAX_SEQ_LEN = 20
 
 _PRODUCT_CACHE = None
@@ -991,17 +999,49 @@ def load_model_comparison() -> list[dict[str, object]]:
     rows = []
     data = pd.read_csv(MODEL_COMPARISON_PATH)
     for row in data.to_dict("records"):
+        model_label = str(row["Model"])
+        if "baseline" in model_label.lower():
+            continue
+        top10 = row.get("Top-10 Accuracy")
+        top20 = row.get("Top-20 Accuracy")
         rows.append(
             {
-                "model": str(row["Model"]),
-                "loss": float(row["Loss"]),
-                "top1": float(row["Accuracy (Top-1)"]),
-                "top5": float(row["Top-5 Accuracy"]),
-                "top10": float(row["Top-10 Accuracy"]),
-                "top20": float(row["Top-20 Accuracy"]),
+                "model": model_label,
+                "loss": float(row["Loss"]) if pd.notna(row.get("Loss")) else None,
+                "top1": float(row["Accuracy (Top-1)"]) if pd.notna(row.get("Accuracy (Top-1)")) else None,
+                "top3": float(row["Top-3 Accuracy"]) if pd.notna(row.get("Top-3 Accuracy")) else None,
+                "top5": float(row["Top-5 Accuracy"]) if pd.notna(row.get("Top-5 Accuracy")) else None,
+                "top10": float(top10) if pd.notna(top10) else None,
+                "top20": float(top20) if pd.notna(top20) else None,
             }
         )
     return rows
+
+
+def metric_or_na(value: object, formatter=format_percent) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return formatter(float(value))
+
+
+def load_model_config() -> dict[str, object]:
+    if not MODEL_CONFIG_PATH.exists():
+        return {"max_seq_len": MAX_SEQ_LEN, "catalog_size": None, "num_items": None, "models": {}}
+
+    with MODEL_CONFIG_PATH.open(encoding="utf-8") as file:
+        return json.load(file)
+
+
+def configured_model_path(model_name: str) -> Path:
+    config = load_model_config()
+    models = config.get("models", {})
+    if isinstance(models, dict) and model_name in models:
+        return MODEL_DIR / str(models[model_name])
+    fallback = {
+        "lstm": MODEL_DIR / "best_lstm_attention_model.keras",
+        "transformer": MODEL_DIR / "best_transformer_model.keras",
+    }
+    return fallback[model_name]
 
 
 def layer_detail(layer: dict[str, object]) -> str:
@@ -1070,8 +1110,10 @@ def render_model_cards(comparison: list[dict[str, object]]) -> str:
         </div>
         """
 
-    best_top20 = max(comparison, key=lambda row: row["top20"])
-    best_loss = min(comparison, key=lambda row: row["loss"])
+    top20_rows = [row for row in comparison if row.get("top20") is not None]
+    loss_rows = [row for row in comparison if row.get("loss") is not None]
+    best_top20 = max(top20_rows, key=lambda row: row["top20"]) if top20_rows else None
+    best_loss = min(loss_rows, key=lambda row: row["loss"]) if loss_rows else None
     cards = []
     for row in comparison:
         cards.append(
@@ -1079,24 +1121,35 @@ def render_model_cards(comparison: list[dict[str, object]]) -> str:
             <article class="metric-card">
               <h3>{html.escape(str(row["model"]))}</h3>
               <p>Đánh giá mô hình dự đoán sản phẩm tiếp theo từ chuỗi giao dịch.</p>
-              <div class="metric-value">{format_percent(float(row["top20"]))}</div>
+              <div class="metric-value">{metric_or_na(row.get("top20"))}</div>
               <p>Top-20 Accuracy</p>
               <dl>
-                <dt>Loss</dt><dd>{float(row["loss"]):.4f}</dd>
-                <dt>Top-1</dt><dd>{format_percent(float(row["top1"]))}</dd>
-                <dt>Top-5</dt><dd>{format_percent(float(row["top5"]))}</dd>
-                <dt>Top-10</dt><dd>{format_percent(float(row["top10"]))}</dd>
+                <dt>Loss</dt><dd>{metric_or_na(row.get("loss"), lambda value: f"{value:.4f}")}</dd>
+                <dt>Top-1</dt><dd>{metric_or_na(row.get("top1"))}</dd>
+                <dt>Top-3</dt><dd>{metric_or_na(row.get("top3"))}</dd>
+                <dt>Top-5</dt><dd>{metric_or_na(row.get("top5"))}</dd>
+                <dt>Top-10</dt><dd>{metric_or_na(row.get("top10"))}</dd>
               </dl>
             </article>
             """
         )
 
+    top20_summary = (
+        f"<li>Mô hình Top-20 tốt nhất: {html.escape(str(best_top20['model']))} ({format_percent(float(best_top20['top20']))}).</li>"
+        if best_top20
+        else "<li>File metric hiện chưa có Top-20 Accuracy hợp lệ để so sánh.</li>"
+    )
+    loss_summary = (
+        f"<li>Mô hình có loss thấp nhất: {html.escape(str(best_loss['model']))} ({float(best_loss['loss']):.4f}).</li>"
+        if best_loss
+        else "<li>File metric hiện chưa có loss hợp lệ để so sánh.</li>"
+    )
     return f"""
     <div class="insights">
       <h2>Tóm tắt nhanh</h2>
       <ul>
-        <li>Mô hình Top-20 tốt nhất: {html.escape(str(best_top20["model"]))} ({format_percent(float(best_top20["top20"]))}).</li>
-        <li>Mô hình có loss thấp nhất: {html.escape(str(best_loss["model"]))} ({float(best_loss["loss"]):.4f}).</li>
+        {top20_summary}
+        {loss_summary}
         <li>Phần này bổ sung góc nhìn sequence modeling bên cạnh frequent itemset mining của bài chính.</li>
       </ul>
     </div>
@@ -1107,6 +1160,7 @@ def render_model_cards(comparison: list[dict[str, object]]) -> str:
 def render_metric_bars(comparison: list[dict[str, object]]) -> str:
     metrics = [
         ("Top-1 Accuracy", "top1"),
+        ("Top-3 Accuracy", "top3"),
         ("Top-5 Accuracy", "top5"),
         ("Top-10 Accuracy", "top10"),
         ("Top-20 Accuracy", "top20"),
@@ -1114,6 +1168,8 @@ def render_metric_bars(comparison: list[dict[str, object]]) -> str:
     rows = []
     for label, key in metrics:
         for row in comparison:
+            if row.get(key) is None:
+                continue
             value = float(row[key])
             class_name = "transformer" if str(row["model"]).lower().startswith("transformer") else ""
             rows.append(
@@ -1129,6 +1185,139 @@ def render_metric_bars(comparison: list[dict[str, object]]) -> str:
     return f"""
     <h2>So sánh accuracy</h2>
     <div class="bar-list">{''.join(rows)}</div>
+    """
+
+
+def load_training_histories() -> dict[str, pd.DataFrame]:
+    histories = {}
+    for label, path in MODEL_HISTORY_PATHS.items():
+        if path.exists():
+            histories[label] = pd.read_csv(path)
+    return histories
+
+
+def svg_points(values: list[float], width: int, height: int, min_value: float, max_value: float) -> str:
+    if not values:
+        return ""
+    if len(values) == 1:
+        x_values = [width / 2]
+    else:
+        x_values = [index * width / (len(values) - 1) for index in range(len(values))]
+    span = max(max_value - min_value, 1e-9)
+    points = []
+    for x, value in zip(x_values, values):
+        y = height - ((value - min_value) / span * height)
+        points.append(f"{x:.1f},{y:.1f}")
+    return " ".join(points)
+
+
+def render_line_chart(title: str, histories: dict[str, pd.DataFrame], columns: list[tuple[str, str]]) -> str:
+    width = 520
+    height = 180
+    series = []
+    for model_label, frame in histories.items():
+        for column, label in columns:
+            if column not in frame:
+                continue
+            values = [float(value) for value in frame[column].dropna().tolist()]
+            if values:
+                series.append((model_label, label, values))
+
+    if not series:
+        return ""
+
+    all_values = [value for _, _, values in series for value in values]
+    min_value = min(all_values)
+    max_value = max(all_values)
+    if max_value <= 1.0:
+        min_value = max(0.0, min_value - 0.02)
+        max_value = min(1.0, max_value + 0.02)
+    else:
+        padding = (max_value - min_value) * 0.08
+        min_value -= padding
+        max_value += padding
+
+    colors = ["#156f6d", "#d27a1f", "#263443", "#8a4b9e"]
+    polylines = []
+    legends = []
+    for index, (model_label, label, values) in enumerate(series):
+        color = colors[index % len(colors)]
+        dash = "5 5" if "Validation" in label else ""
+        polylines.append(
+            f'<polyline points="{svg_points(values, width, height, min_value, max_value)}" '
+            f'fill="none" stroke="{color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" '
+            f'stroke-dasharray="{dash}" />'
+        )
+        legends.append(
+            f'<span><i style="background:{color}"></i>{html.escape(model_label)} - {html.escape(label)}</span>'
+        )
+
+    return f"""
+    <article class="chart-card">
+      <h3>{html.escape(title)}</h3>
+      <svg viewBox="0 0 {width} {height}" role="img" aria-label="{html.escape(title)}">
+        <line x1="0" y1="{height}" x2="{width}" y2="{height}" />
+        <line x1="0" y1="0" x2="0" y2="{height}" />
+        {''.join(polylines)}
+      </svg>
+      <div class="chart-legend">{''.join(legends)}</div>
+    </article>
+    """
+
+
+def render_training_charts() -> str:
+    histories = load_training_histories()
+    if not histories:
+        return ""
+
+    return f"""
+    <h2>Biểu đồ quá trình train</h2>
+    <div class="chart-grid">
+      {render_line_chart("Top-10 Accuracy theo epoch", histories, [("top_10_accuracy", "Train"), ("val_top_10_accuracy", "Validation")])}
+      {render_line_chart("Loss theo epoch", histories, [("loss", "Train"), ("val_loss", "Validation")])}
+    </div>
+    """
+
+
+def render_metric_heatmap(comparison: list[dict[str, object]]) -> str:
+    metrics = [
+        ("Top-1", "top1"),
+        ("Top-3", "top3"),
+        ("Top-5", "top5"),
+        ("Top-10", "top10"),
+        ("Top-20", "top20"),
+    ]
+    values = [float(row[key]) for row in comparison for _, key in metrics if row.get(key) is not None]
+    if not values:
+        return ""
+
+    min_value = min(values)
+    max_value = max(values)
+    span = max(max_value - min_value, 1e-9)
+    rows = []
+    for row in comparison:
+        cells = []
+        for label, key in metrics:
+            value = row.get(key)
+            if value is None:
+                cells.append("<td>N/A</td>")
+                continue
+            intensity = (float(value) - min_value) / span
+            cells.append(
+                f'<td style="--heat:{intensity:.3f}"><strong>{format_percent(float(value))}</strong><span>{html.escape(label)}</span></td>'
+            )
+        rows.append(
+            f"<tr><th>{html.escape(str(row['model']))}</th>{''.join(cells)}</tr>"
+        )
+
+    return f"""
+    <h2>Heatmap Top-K Accuracy</h2>
+    <div class="table-wrap heatmap-wrap">
+      <table class="heatmap">
+        <tbody>{''.join(rows)}</tbody>
+      </table>
+    </div>
+    <p class="note">Chưa hiển thị ma trận nhầm lẫn vì thư mục model hiện không có file nhãn thật/dự đoán từng mẫu. Heatmap này dùng metric đánh giá thật từ Kaggle.</p>
     """
 
 
@@ -1173,21 +1362,26 @@ def render_architecture_card(title: str, info: dict[str, object]) -> str:
 
 
 def render_model_assets() -> str:
-    article_count = "N/A"
+    config = load_model_config()
+    catalog_size = config.get("catalog_size")
+    num_items = config.get("num_items")
+    top_item_count = "N/A"
     mapped_count = "N/A"
-    if (MODEL_DIR / "articles_filtered.csv").exists():
-        article_count = f"{len(pd.read_csv(MODEL_DIR / 'articles_filtered.csv', usecols=['article_id'])):,}"
-    if (MODEL_DIR / "article_id_map.csv").exists():
-        mapped_count = f"{len(pd.read_csv(MODEL_DIR / 'article_id_map.csv', usecols=['article_id'])):,}"
+    if TOP_ITEMS_PATH.exists():
+        top_item_count = f"{len(pd.read_csv(TOP_ITEMS_PATH)):,}"
+    if OLD_TO_NEW_MAP_PATH.exists():
+        with OLD_TO_NEW_MAP_PATH.open(encoding="utf-8") as file:
+            mapped_count = f"{len(json.load(file)):,}"
 
     return f"""
     <div class="model-grid">
       <article class="asset-card">
         <h3>Dữ liệu sản phẩm</h3>
-        <p>Danh sách article đã lọc để train và giải thích output của mô hình.</p>
+        <p>Danh sách item phổ biến đã dùng khi train lại model trên Kaggle.</p>
         <dl>
-          <dt>Articles</dt><dd>{article_count}</dd>
+          <dt>Top items</dt><dd>{top_item_count}</dd>
           <dt>Mapping</dt><dd>{mapped_count}</dd>
+          <dt>Catalog size</dt><dd>{html.escape(str(catalog_size if catalog_size is not None else "N/A"))}</dd>
           <dt>Thư mục</dt><dd>{html.escape(str(MODEL_DIR))}</dd>
         </dl>
       </article>
@@ -1195,8 +1389,8 @@ def render_model_assets() -> str:
         <h3>Mục tiêu mô hình</h3>
         <p>Dự đoán item tiếp theo hoặc nhóm item ứng viên từ lịch sử mua hàng, phù hợp để trình bày như phần mở rộng recommender system.</p>
         <dl>
-          <dt>Input</dt><dd>Chuỗi article_idx</dd>
-          <dt>Output</dt><dd>Phân phối xác suất trên 3,000 article</dd>
+          <dt>Input</dt><dd>Chuỗi old_article_idx</dd>
+          <dt>Output</dt><dd>Phân phối xác suất trên {html.escape(str(num_items if num_items is not None else "N/A"))} vị trí</dd>
           <dt>Metric</dt><dd>Top-K Accuracy</dd>
         </dl>
       </article>
@@ -1209,22 +1403,22 @@ def get_deep_learning_data() -> dict[str, object]:
     if _PRODUCT_CACHE is not None:
         return _PRODUCT_CACHE
 
-    articles = pd.read_csv(MODEL_DIR / "articles_filtered.csv", dtype={"article_id": "string"})
-    mapping = pd.read_csv(MODEL_DIR / "article_id_map.csv", dtype={"article_id": "string"})
-    articles["article_id"] = articles["article_id"].astype("string").str.zfill(10)
-    mapping["article_id"] = mapping["article_id"].astype("string").str.zfill(10)
-    articles["article_idx"] = articles["article_idx"].astype(int)
-    mapping["article_idx"] = mapping["article_idx"].astype(int)
+    top_items = pd.read_csv(TOP_ITEMS_PATH)
+    top_items["old_article_idx"] = top_items["old_article_idx"].astype(int)
+    top_items["new_item_idx"] = top_items["new_item_idx"].astype(int)
 
-    article_id_to_idx = dict(zip(mapping["article_id"], mapping["article_idx"]))
-    article_idx_to_id = dict(zip(mapping["article_idx"], mapping["article_id"]))
-    article_by_idx = articles.set_index("article_idx").to_dict("index")
+    with OLD_TO_NEW_MAP_PATH.open(encoding="utf-8") as file:
+        old_to_new = {int(key): int(value) for key, value in json.load(file).items()}
+    with NEW_TO_OLD_MAP_PATH.open(encoding="utf-8") as file:
+        new_to_old = {int(key): int(value) for key, value in json.load(file).items()}
+
+    item_by_new = top_items.set_index("new_item_idx").to_dict("index")
 
     _PRODUCT_CACHE = {
-        "articles": articles,
-        "article_id_to_idx": article_id_to_idx,
-        "article_idx_to_id": article_idx_to_id,
-        "article_by_idx": article_by_idx,
+        "top_items": top_items,
+        "old_to_new": old_to_new,
+        "new_to_old": new_to_old,
+        "item_by_new": item_by_new,
     }
     return _PRODUCT_CACHE
 
@@ -1232,49 +1426,44 @@ def get_deep_learning_data() -> dict[str, object]:
 def get_transformer_custom_objects():
     import tensorflow as tf
 
-    class TokenAndPositionEmbedding(tf.keras.layers.Layer):
-        def __init__(self, maxlen, vocab_size, embed_dim, **kwargs):
+    @tf.keras.utils.register_keras_serializable(package="Custom")
+    class AttentionPooling(tf.keras.layers.Layer):
+        def __init__(self, **kwargs):
             super().__init__(**kwargs)
-            self.maxlen = maxlen
+            self.score_dense = tf.keras.layers.Dense(1)
+
+        def call(self, inputs, mask=None):
+            scores = self.score_dense(inputs)
+            scores = tf.squeeze(scores, axis=-1)
+            weights = tf.nn.softmax(scores, axis=1)
+            weights = tf.expand_dims(weights, axis=-1)
+            return tf.reduce_sum(inputs * weights, axis=1)
+
+        def get_config(self):
+            return super().get_config()
+
+    @tf.keras.utils.register_keras_serializable(package="Custom")
+    class PositionalEmbedding(tf.keras.layers.Layer):
+        def __init__(self, max_len, vocab_size, embed_dim, **kwargs):
+            super().__init__(**kwargs)
+            self.max_len = max_len
             self.vocab_size = vocab_size
             self.embed_dim = embed_dim
-            self.token_emb = tf.keras.layers.Embedding(
-                input_dim=vocab_size,
-                output_dim=embed_dim,
-                mask_zero=True,
-                name="token_emb",
-            )
-            self.pos_emb = tf.keras.layers.Embedding(
-                input_dim=maxlen,
-                output_dim=embed_dim,
-                name="pos_emb",
-            )
-            self.supports_masking = True
-
-        def build(self, input_shape):
-            self.token_emb.build(input_shape)
-            self.pos_emb.build((self.maxlen,))
-            super().build(input_shape)
+            self.token_emb = tf.keras.layers.Embedding(input_dim=vocab_size, output_dim=embed_dim, mask_zero=False)
+            self.pos_emb = tf.keras.layers.Embedding(input_dim=max_len, output_dim=embed_dim)
 
         def call(self, x):
-            maxlen = tf.shape(x)[-1]
-            positions = tf.range(start=0, limit=maxlen, delta=1)
-            return self.token_emb(x) + self.pos_emb(positions)
-
-        def compute_mask(self, inputs, mask=None):
-            return self.token_emb.compute_mask(inputs)
+            positions = tf.range(start=0, limit=self.max_len, delta=1)
+            positions = self.pos_emb(positions)
+            x = self.token_emb(x)
+            return x + positions
 
         def get_config(self):
             config = super().get_config()
-            config.update(
-                {
-                    "maxlen": self.maxlen,
-                    "vocab_size": self.vocab_size,
-                    "embed_dim": self.embed_dim,
-                }
-            )
+            config.update({"max_len": self.max_len, "vocab_size": self.vocab_size, "embed_dim": self.embed_dim})
             return config
 
+    @tf.keras.utils.register_keras_serializable(package="Custom")
     class TransformerBlock(tf.keras.layers.Layer):
         def __init__(self, embed_dim, num_heads, ff_dim, dropout_rate=0.1, **kwargs):
             super().__init__(**kwargs)
@@ -1282,73 +1471,36 @@ def get_transformer_custom_objects():
             self.num_heads = num_heads
             self.ff_dim = ff_dim
             self.dropout_rate = dropout_rate
-            self.attention = tf.keras.layers.MultiHeadAttention(
-                num_heads=num_heads,
-                key_dim=embed_dim,
-                name="attention",
-            )
-            self.ffn = tf.keras.Sequential(
-                [
-                    tf.keras.layers.Dense(ff_dim, activation="relu"),
-                    tf.keras.layers.Dense(embed_dim),
-                ],
-                name="ffn",
-            )
-            self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6, name="layernorm1")
-            self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6, name="layernorm2")
-            self.dropout1 = tf.keras.layers.Dropout(dropout_rate, name="dropout1")
-            self.dropout2 = tf.keras.layers.Dropout(dropout_rate, name="dropout2")
-            self.supports_masking = True
+            self.att = tf.keras.layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim // num_heads)
+            self.ffn = tf.keras.Sequential([
+                tf.keras.layers.Dense(ff_dim, activation="relu"),
+                tf.keras.layers.Dense(embed_dim),
+            ])
+            self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+            self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+            self.dropout1 = tf.keras.layers.Dropout(dropout_rate)
+            self.dropout2 = tf.keras.layers.Dropout(dropout_rate)
 
-        def build(self, input_shape):
-            self.attention.build(input_shape, input_shape)
-            self.ffn.build(input_shape)
-            self.layernorm1.build(input_shape)
-            self.layernorm2.build(input_shape)
-            super().build(input_shape)
-
-        def call(self, inputs, training=False, mask=None):
-            attention_mask = None
-            if mask is not None:
-                attention_mask = tf.cast(mask[:, tf.newaxis, :], dtype="bool")
-            attn_output = self.attention(inputs, inputs, attention_mask=attention_mask)
+        def call(self, inputs, training=False):
+            attn_output = self.att(inputs, inputs)
             attn_output = self.dropout1(attn_output, training=training)
             out1 = self.layernorm1(inputs + attn_output)
             ffn_output = self.ffn(out1)
             ffn_output = self.dropout2(ffn_output, training=training)
             return self.layernorm2(out1 + ffn_output)
 
-        def compute_mask(self, inputs, mask=None):
-            return mask
-
         def get_config(self):
             config = super().get_config()
-            config.update(
-                {
-                    "embed_dim": self.embed_dim,
-                    "num_heads": self.num_heads,
-                    "ff_dim": self.ff_dim,
-                    "dropout_rate": self.dropout_rate,
-                }
-            )
+            config.update({"embed_dim": self.embed_dim, "num_heads": self.num_heads, "ff_dim": self.ff_dim, "dropout_rate": self.dropout_rate})
             return config
 
-    class LastNonZeroPooling(tf.keras.layers.Layer):
-        def call(self, inputs, mask=None):
-            if mask is None:
-                mask = tf.reduce_any(tf.not_equal(inputs, 0), axis=-1)
-            lengths = tf.reduce_sum(tf.cast(mask, tf.int32), axis=1)
-            lengths = tf.maximum(lengths, 1)
-            indices = tf.stack([tf.range(tf.shape(inputs)[0]), lengths - 1], axis=1)
-            return tf.gather_nd(inputs, indices)
-
-        def compute_mask(self, inputs, mask=None):
-            return None
-
     return {
-        "TokenAndPositionEmbedding": TokenAndPositionEmbedding,
+        "AttentionPooling": AttentionPooling,
+        "Custom>AttentionPooling": AttentionPooling,
+        "PositionalEmbedding": PositionalEmbedding,
+        "Custom>PositionalEmbedding": PositionalEmbedding,
         "TransformerBlock": TransformerBlock,
-        "LastNonZeroPooling": LastNonZeroPooling,
+        "Custom>TransformerBlock": TransformerBlock,
     }
 
 
@@ -1359,10 +1511,14 @@ def load_prediction_model(model_name: str):
     import tensorflow as tf
 
     if model_name == "lstm":
-        model = tf.keras.models.load_model(MODEL_DIR / "lstm_hm_model.keras", compile=False)
+        model = tf.keras.models.load_model(
+            configured_model_path("lstm"),
+            custom_objects=get_transformer_custom_objects(),
+            compile=False,
+        )
     elif model_name == "transformer":
         model = tf.keras.models.load_model(
-            MODEL_DIR / "transformer_hm_model.keras",
+            configured_model_path("transformer"),
             custom_objects=get_transformer_custom_objects(),
             compile=False,
         )
@@ -1375,25 +1531,39 @@ def load_prediction_model(model_name: str):
 
 def parse_article_ids(raw_value: str) -> list[str]:
     tokens = raw_value.replace(",", " ").replace("\n", " ").split()
-    return [token.strip().zfill(10) for token in tokens if token.strip()]
+    return [token.strip() for token in tokens if token.strip()]
 
 
 def pad_sequence(sequence: list[int]) -> list[int]:
-    trimmed = sequence[-MAX_SEQ_LEN:]
-    return trimmed + [0] * (MAX_SEQ_LEN - len(trimmed))
+    max_seq_len = int(load_model_config().get("max_seq_len", MAX_SEQ_LEN))
+    trimmed = sequence[-max_seq_len:]
+    return trimmed + [0] * (max_seq_len - len(trimmed))
 
 
 def recommend_with_prediction_model(model_name: str, article_ids: list[str], top_k: int) -> dict[str, object]:
     import numpy as np
 
     data = get_deep_learning_data()
-    article_id_to_idx = data["article_id_to_idx"]
-    article_by_idx = data["article_by_idx"]
+    old_to_new = data["old_to_new"]
+    new_to_old = data["new_to_old"]
+    item_by_new = data["item_by_new"]
 
-    unknown = [article_id for article_id in article_ids if article_id not in article_id_to_idx]
-    input_sequence = [article_id_to_idx[article_id] for article_id in article_ids if article_id in article_id_to_idx]
+    parsed_old_ids = []
+    unknown = []
+    for article_id in article_ids:
+        try:
+            old_article_idx = int(article_id)
+        except ValueError:
+            unknown.append(article_id)
+            continue
+        if old_article_idx not in old_to_new:
+            unknown.append(article_id)
+            continue
+        parsed_old_ids.append(old_article_idx)
+
+    input_sequence = [old_to_new[old_article_idx] for old_article_idx in parsed_old_ids]
     if not input_sequence:
-        raise ValueError("Không có article_id hợp lệ trong input.")
+        raise ValueError("Không có old_article_idx hợp lệ trong input.")
 
     model = load_prediction_model(model_name)
     input_padded = np.array([pad_sequence(input_sequence)], dtype="int32")
@@ -1404,21 +1574,19 @@ def recommend_with_prediction_model(model_name: str, article_ids: list[str], top
     blocked = set(input_sequence)
     candidate_indices = np.argsort(predictions)[::-1]
     recommendations = []
-    for article_idx in candidate_indices:
-        article_idx = int(article_idx)
-        if article_idx == 0 or article_idx in blocked or article_idx not in article_by_idx:
+    for new_item_idx in candidate_indices:
+        new_item_idx = int(new_item_idx)
+        if new_item_idx == 0 or new_item_idx in blocked or new_item_idx not in new_to_old:
             continue
-        product = article_by_idx[article_idx]
+        item = item_by_new.get(new_item_idx, {})
+        old_article_idx = int(new_to_old[new_item_idx])
         recommendations.append(
             {
                 "rank": len(recommendations) + 1,
-                "article_idx": article_idx,
-                "article_id": str(product.get("article_id", "")).zfill(10),
-                "prod_name": str(product.get("prod_name", "")),
-                "product_type_name": str(product.get("product_type_name", "")),
-                "product_group_name": str(product.get("product_group_name", "")),
-                "colour_group_name": str(product.get("colour_group_name", "")),
-                "score": float(predictions[article_idx]),
+                "new_item_idx": new_item_idx,
+                "old_article_idx": old_article_idx,
+                "catalog_rank": int(item.get("rank", 0)) if item else None,
+                "score": float(predictions[new_item_idx]),
             }
         )
         if len(recommendations) >= top_k:
@@ -1427,6 +1595,7 @@ def recommend_with_prediction_model(model_name: str, article_ids: list[str], top
     return {
         "model": model_name,
         "input_sequence": input_sequence,
+        "input_old_article_indices": parsed_old_ids,
         "unknown_article_ids": unknown,
         "elapsed_seconds": elapsed,
         "recommendations": recommendations,
@@ -1441,11 +1610,9 @@ def render_recommendation_result(results: list[dict[str, object]], article_ids: 
             rows.append(
                 "<tr>"
                 f"<td>{item['rank']}</td>"
-                f"<td>{html.escape(item['article_id'])}</td>"
-                f"<td>{html.escape(item['prod_name'])}</td>"
-                f"<td>{html.escape(item['product_type_name'])}</td>"
-                f"<td>{html.escape(item['product_group_name'])}</td>"
-                f"<td>{html.escape(item['colour_group_name'])}</td>"
+                f"<td>{item['old_article_idx']}</td>"
+                f"<td>{item['new_item_idx']}</td>"
+                f"<td>{item['catalog_rank'] or 'N/A'}</td>"
                 f"<td>{item['score']:.6f}</td>"
                 "</tr>"
             )
@@ -1468,11 +1635,9 @@ def render_recommendation_result(results: list[dict[str, object]], article_ids: 
                   <thead>
                     <tr>
                       <th>#</th>
-                      <th>article_id</th>
-                      <th>Tên sản phẩm</th>
-                      <th>Loại</th>
-                      <th>Nhóm</th>
-                      <th>Màu</th>
+                      <th>old_article_idx</th>
+                      <th>new_item_idx</th>
+                      <th>Rank trong top_items</th>
                       <th>Score</th>
                     </tr>
                   </thead>
@@ -1488,7 +1653,7 @@ def render_recommendation_result(results: list[dict[str, object]], article_ids: 
       <h2>Kết quả chạy model thật</h2>
       <ul>
         <li>Chuỗi đầu vào: {html.escape(', '.join(article_ids))}</li>
-        <li>Backend đã chuyển article_id sang article_idx, padding về {MAX_SEQ_LEN}, rồi gọi trực tiếp <code>model.predict()</code>.</li>
+        <li>Backend đã chuyển old_article_idx sang new_item_idx, padding theo <code>model_config.json</code>, rồi gọi trực tiếp <code>model.predict()</code>.</li>
       </ul>
     </div>
     {''.join(sections)}
@@ -1497,15 +1662,15 @@ def render_recommendation_result(results: list[dict[str, object]], article_ids: 
 
 def render_model_demo_form(values: dict[str, str], result_html: str = "") -> str:
     data = get_deep_learning_data()
-    articles = data["articles"].head(6)
+    top_items = data["top_items"].head(6)
     sample_items = []
-    for row in articles.itertuples(index=False):
+    for row in top_items.itertuples(index=False):
         sample_items.append(
             f"""
             <div class="sample-product">
-              <strong>{html.escape(str(row.prod_name))}</strong>
-              <span>{html.escape(str(row.article_id))} - {html.escape(str(row.product_type_name))} - {html.escape(str(row.colour_group_name))}</span>
-              <button type="button" data-article-id="{html.escape(str(row.article_id))}">Thêm vào input</button>
+              <strong>old_article_idx {html.escape(str(row.old_article_idx))}</strong>
+              <span>new_item_idx {html.escape(str(row.new_item_idx))} - rank {html.escape(str(row.rank))}</span>
+              <button type="button" data-article-id="{html.escape(str(row.old_article_idx))}">Thêm vào input</button>
             </div>
             """
         )
@@ -1529,9 +1694,9 @@ def render_model_demo_form(values: dict[str, str], result_html: str = "") -> str
     <div class="model-demo">
       <form action="/models/run" method="get">
         <label>
-          <span>Chuỗi article_id đã mua/đã xem</span>
-          <textarea name="article_ids" id="article_ids" placeholder="Ví dụ: 0111586001, 0111593001, 0123173001">{html.escape(values["article_ids"])}</textarea>
-          <small>Nhập nhiều article_id, cách nhau bằng dấu phẩy, khoảng trắng hoặc xuống dòng. Model chỉ dùng tối đa {MAX_SEQ_LEN} item cuối.</small>
+          <span>Chuỗi old_article_idx đã mua/đã xem</span>
+          <textarea name="article_ids" id="article_ids" placeholder="Ví dụ: 507, 712, 290">{html.escape(values["article_ids"])}</textarea>
+          <small>Nhập nhiều old_article_idx, cách nhau bằng dấu phẩy, khoảng trắng hoặc xuống dòng. Model chỉ dùng tối đa {int(load_model_config().get("max_seq_len", MAX_SEQ_LEN))} item cuối.</small>
         </label>
         <label>
           <span>Model</span>
@@ -1550,7 +1715,7 @@ def render_model_demo_form(values: dict[str, str], result_html: str = "") -> str
         </div>
       </form>
       <div>
-        {result_html or '<div class="empty-state"><p>Nhập chuỗi sản phẩm rồi chạy LSTM/Transformer để xem gợi ý sản phẩm tiếp theo.</p></div>'}
+        {result_html or '<div class="empty-state"><p>Nhập chuỗi old_article_idx rồi chạy LSTM/Transformer để xem gợi ý sản phẩm tiếp theo.</p></div>'}
       </div>
     </div>
     """
@@ -1591,8 +1756,8 @@ def run_model_query(query: dict[str, list[str]]) -> tuple[dict[str, str], str]:
 
 def render_models_page(result_html: str = "", values: dict[str, str] | None = None) -> str:
     comparison = load_model_comparison()
-    lstm_info = inspect_keras_model(MODEL_DIR / "lstm_hm_model.keras")
-    transformer_info = inspect_keras_model(MODEL_DIR / "transformer_hm_model.keras")
+    lstm_info = inspect_keras_model(configured_model_path("lstm"))
+    transformer_info = inspect_keras_model(configured_model_path("transformer"))
     if values is None:
         values = model_values_from_query(None)
     comparison_table = ""
@@ -1600,11 +1765,12 @@ def render_models_page(result_html: str = "", values: dict[str, str] | None = No
         table_rows = "\n".join(
             "<tr>"
             f"<td>{html.escape(str(row['model']))}</td>"
-            f"<td>{float(row['loss']):.4f}</td>"
-            f"<td>{format_percent(float(row['top1']))}</td>"
-            f"<td>{format_percent(float(row['top5']))}</td>"
-            f"<td>{format_percent(float(row['top10']))}</td>"
-            f"<td>{format_percent(float(row['top20']))}</td>"
+            f"<td>{metric_or_na(row.get('loss'), lambda value: f'{value:.4f}')}</td>"
+            f"<td>{metric_or_na(row.get('top1'))}</td>"
+            f"<td>{metric_or_na(row.get('top3'))}</td>"
+            f"<td>{metric_or_na(row.get('top5'))}</td>"
+            f"<td>{metric_or_na(row.get('top10'))}</td>"
+            f"<td>{metric_or_na(row.get('top20'))}</td>"
             "</tr>"
             for row in comparison
         )
@@ -1617,6 +1783,7 @@ def render_models_page(result_html: str = "", values: dict[str, str] | None = No
                 <th>Model</th>
                 <th>Loss</th>
                 <th>Top-1</th>
+                <th>Top-3</th>
                 <th>Top-5</th>
                 <th>Top-10</th>
                 <th>Top-20</th>
@@ -1656,6 +1823,8 @@ def render_models_page(result_html: str = "", values: dict[str, str] | None = No
       {render_model_demo_form(values, result_html)}
       {render_model_cards(comparison)}
       {render_metric_bars(comparison) if comparison else ""}
+      {render_metric_heatmap(comparison) if comparison else ""}
+      {render_training_charts()}
       {comparison_table}
       <h2>Kiến trúc model</h2>
       <div class="model-grid">
@@ -2136,6 +2305,76 @@ APP_STYLES = """
       background: var(--accent);
     }
     .bar-fill.transformer { background: var(--amber); }
+    .chart-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin: 12px 0 18px;
+    }
+    .chart-card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      padding: 14px;
+    }
+    .chart-card h3 { margin-bottom: 10px; }
+    .chart-card svg {
+      display: block;
+      width: 100%;
+      height: auto;
+      overflow: visible;
+    }
+    .chart-card line {
+      stroke: #d8e0e6;
+      stroke-width: 1;
+    }
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .chart-legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .chart-legend i {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+    .heatmap-wrap { margin: 12px 0 8px; }
+    .heatmap th {
+      text-align: left;
+      white-space: nowrap;
+      background: #f7f9fb;
+    }
+    .heatmap td {
+      background: color-mix(in srgb, var(--accent) calc(22% + var(--heat) * 58%), #ffffff);
+      min-width: 110px;
+    }
+    .heatmap td strong {
+      display: block;
+      color: var(--ink);
+      font-size: 15px;
+    }
+    .heatmap td span {
+      display: block;
+      margin-top: 2px;
+      color: #41505f;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .note {
+      margin: 0 0 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
     textarea {
       width: 100%;
       min-height: 96px;
@@ -2197,7 +2436,7 @@ APP_STYLES = """
       main { width: min(100vw - 20px, 1240px); margin-top: 14px; }
       h1 { font-size: 24px; }
       form, .result, .tables > div { padding: 14px; }
-      .checks, .combo-grid, .model-grid, .metric-grid { grid-template-columns: 1fr; }
+      .checks, .combo-grid, .model-grid, .metric-grid, .chart-grid { grid-template-columns: 1fr; }
       .bar-row { grid-template-columns: 1fr; }
       .actions > * { width: 100%; }
       th, td { padding: 9px; }
